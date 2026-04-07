@@ -1,28 +1,29 @@
-version: "3.9"
-
 services:
   ouroboros:
     build: .
     restart: unless-stopped
-    env_file:
-      - .env
+
+    # Load secrets from .env file (copy from .env.example and fill in)
+    env_file: .env
+
     volumes:
-      # Persistent local Drive (state, logs, memory)
+      # Persistent storage: host path → container /data/ouroboros
+      # Windows WSL2: use a WSL path, e.g. /home/<user>/.ouroboros
+      # or a Windows path:  C:\ouroboros\data:/data/ouroboros
       - ouroboros_data:/data/ouroboros
-      # Persistent repo clone (avoids re-cloning on restart)
-      - ouroboros_repo:/app/ouroboros_repo
-    environment:
-      DRIVE_ROOT: /data/ouroboros
-      REPO_DIR: /app/ouroboros_repo
-      PYTHONUNBUFFERED: "1"
-    # Optional: limit resources to avoid runaway costs
-    # deploy:
-    #   resources:
-    #     limits:
-    #       memory: 2g
+
+    # Optional: expose nothing (Telegram is the only interface)
+    # ports: []
+
+    # Give it a bit of memory — default is fine for most cases
+    # mem_limit: 2g
 
 volumes:
   ouroboros_data:
-    driver: local
-  ouroboros_repo:
-    driver: local
+    # Named volume — Docker manages it.
+    # To use a host directory instead, replace with:
+    #   driver: local
+    #   driver_opts:
+    #     type: none
+    #     device: /your/host/path
+    #     o: bind
