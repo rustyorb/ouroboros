@@ -1,32 +1,35 @@
 FROM python:3.11-slim
 
-# System deps: git for repo ops, curl/bash for Claude CLI install, nodejs/npm for claude-code
+# System deps: git (for self-update), curl/nodejs (for Claude Code CLI, optional)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl bash nodejs npm \
+        git \
+        curl \
+        ca-certificates \
+        nodejs \
+        npm \
     && rm -rf /var/lib/apt/lists/*
 
+# Working directory = the repo
 WORKDIR /app
 
-# Python deps
+# Install Python deps first (cached layer)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Install Playwright browsers (needed for browser automation tools)
-RUN playwright install --with-deps chromium
+RUN pip install --no-cache-dir playwright playwright-stealth \
+    && playwright install chromium --with-deps || true
 
-# Install Claude Code CLI (best-effort — may fail if npm is old, that's OK)
-RUN npm install -g @anthropic-ai/claude-code || true
-
-# Copy repo
+# Copy the rest of the repo
 COPY . .
 
-# Create local Drive volume mount point
-RUN mkdir -p /data/ouroboros
+# Data volume — mount a host directory here for persistent storage
+# (state, logs, memory — replaces Google Drive in Colab)
+VOLUME ["/data/ouroboros"]
 
-# Environment defaults (override via docker-compose env_file or -e flags)
-ENV DRIVE_ROOT=/data/ouroboros
-ENV REPO_DIR=/app/ouroboros_repo
-ENV PYTHONPATH=/app
-ENV PYTHONUNBUFFERED=1
+# Tell docker_launcher.py where to find the Drive root and repo
+ENV OUROBOROS_DRIVE_ROOT=/data/ouroboros
+ENV OUROBOROS_REPO_DIR=/app
 
+# Entrypoint
 CMD ["python", "docker_launcher.py"]
