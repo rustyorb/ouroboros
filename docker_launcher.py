@@ -1,18 +1,27 @@
 # ============================
-# Ouroboros — Docker launcher (local/self-hosted entry point)
+# Ouroboros — Docker / local launcher (Colab-free entry point)
 # ============================
-# Drop-in replacement for colab_launcher.py for running outside Colab.
-# Reads all secrets from env vars. Uses local filesystem for Drive.
-# No google.colab dependencies.
+# Drop-in replacement for colab_launcher.py that reads secrets from env vars
+# and uses a local directory for Drive storage instead of Google Drive.
+#
+# Usage:
+#   cp .env.example .env && nano .env   # fill in your keys
+#   docker compose up --build
+#
+# All heavy logic lives in supervisor/ — this file is thin glue.
 
 import logging
 import os, sys, json, time, uuid, pathlib, subprocess, datetime, threading, queue as _queue_mod
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 log = logging.getLogger(__name__)
 
 # ----------------------------
-# 0) Install launcher deps
+# 0) Install deps (if needed)
 # ----------------------------
 def install_launcher_deps() -> None:
     subprocess.run(
@@ -23,40 +32,36 @@ def install_launcher_deps() -> None:
 install_launcher_deps()
 
 def ensure_claude_code_cli() -> bool:
-    """Best-effort install of Claude Code CLI for Anthropic-powered code edits."""
+    """Best-effort install of Claude Code CLI."""
     local_bin = str(pathlib.Path.home() / ".local" / "bin")
     if local_bin not in os.environ.get("PATH", ""):
         os.environ["PATH"] = f"{local_bin}:{os.environ.get('PATH', '')}"
-
     has_cli = subprocess.run(["bash", "-lc", "command -v claude >/dev/null 2>&1"], check=False).returncode == 0
     if has_cli:
         return True
-
     subprocess.run(["bash", "-lc", "curl -fsSL https://claude.ai/install.sh | bash"], check=False)
     has_cli = subprocess.run(["bash", "-lc", "command -v claude >/dev/null 2>&1"], check=False).returncode == 0
     if has_cli:
         return True
-
     subprocess.run(["bash", "-lc", "command -v npm >/dev/null 2>&1 && npm install -g @anthropic-ai/claude-code"], check=False)
     has_cli = subprocess.run(["bash", "-lc", "command -v claude >/dev/null 2>&1"], check=False).returncode == 0
     return has_cli
 
-# ----------------------------
-# 0.1) provide apply_patch shim
-# ----------------------------
+# apply_patch shim (needed for Claude Code integration)
 from ouroboros.apply_patch import install as install_apply_patch
 from ouroboros.llm import DEFAULT_LIGHT_MODEL
 install_apply_patch()
 
 # ----------------------------
-# 1) Secrets + runtime config
+# 1) Secrets — from env only
 # ----------------------------
-# All secrets read from environment variables — no Colab userdata
+_LEGACY_CFG_WARNED: Set[str] = set()
 
 def get_secret(name: str, default: Optional[str] = None, required: bool = False) -> Optional[str]:
     v = os.environ.get(name, default)
     if required:
-        assert v is not None and str(v).strip() != "", f"Missing required secret: {name}"
+        assert v is not None and str(v).strip() != "", \
+            f"Missing required env var: {name}. Set it in your .env file."
     return v
 
 def get_cfg(name: str, default: Optional[str] = None, allow_legacy_secret: bool = False) -> Optional[str]:
@@ -65,7 +70,6 @@ def get_cfg(name: str, default: Optional[str] = None, allow_legacy_secret: bool 
         return v
     return default
 
-
 def _parse_int_cfg(raw: Optional[str], default: int, minimum: int = 0) -> int:
     try:
         val = int(str(raw))
@@ -73,55 +77,42 @@ def _parse_int_cfg(raw: Optional[str], default: int, minimum: int = 0) -> int:
         val = default
     return max(minimum, val)
 
+import re
 OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY", required=True)
 TELEGRAM_BOT_TOKEN = get_secret("TELEGRAM_BOT_TOKEN", required=True)
 TOTAL_BUDGET_DEFAULT = get_secret("TOTAL_BUDGET", required=True)
 GITHUB_TOKEN = get_secret("GITHUB_TOKEN", required=True)
 
-# Robust TOTAL_BUDGET parsing
-try:
-    import re
-    _raw_budget = str(TOTAL_BUDGET_DEFAULT or "")
-    _clean_budget = re.sub(r'[^0-9.\-]', '', _raw_budget)
-    TOTAL_BUDGET_LIMIT = float(_clean_budget) if _clean_budget else 0.0
-    if _raw_budget.strip() != _clean_budget:
-        log.warning(f"TOTAL_BUDGET cleaned: {_raw_budget!r} → {TOTAL_BUDGET_LIMIT}")
-except Exception as e:
-    log.warning(f"Failed to parse TOTAL_BUDGET ({TOTAL_BUDGET_DEFAULT!r}): {e}")
-    TOTAL_BUDGET_LIMIT = 0.0
+_raw_budget = str(TOTAL_BUDGET_DEFAULT or "")
+_clean_budget = re.sub(r'[^0-9.\-]', '', _raw_budget)
+TOTAL_BUDGET_LIMIT = float(_clean_budget) if _clean_budget else 0.0
 
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY", default="")
 ANTHROPIC_API_KEY = get_secret("ANTHROPIC_API_KEY", default="")
 GITHUB_USER = get_cfg("GITHUB_USER", default=None)
 GITHUB_REPO = get_cfg("GITHUB_REPO", default=None)
-assert GITHUB_USER and str(GITHUB_USER).strip(), "GITHUB_USER not set. Add it to your .env file."
-assert GITHUB_REPO and str(GITHUB_REPO).strip(), "GITHUB_REPO not set. Add it to your .env file."
+assert GITHUB_USER and str(GITHUB_USER).strip(), "GITHUB_USER not set."
+assert GITHUB_REPO and str(GITHUB_REPO).strip(), "GITHUB_REPO not set."
+
 MAX_WORKERS = int(get_cfg("OUROBOROS_MAX_WORKERS", default="5") or "5")
-MODEL_MAIN = get_cfg("OUROBOROS_MODEL", default="anthropic/claude-sonnet-4.6")
-MODEL_CODE = get_cfg("OUROBOROS_MODEL_CODE", default="anthropic/claude-sonnet-4.6")
+MODEL_MAIN = get_cfg("OUROBOROS_MODEL", default="anthropic/claude-sonnet-4-5")
+MODEL_CODE = get_cfg("OUROBOROS_MODEL_CODE", default="anthropic/claude-sonnet-4-5")
 MODEL_LIGHT = get_cfg("OUROBOROS_MODEL_LIGHT", default=DEFAULT_LIGHT_MODEL)
 
 BUDGET_REPORT_EVERY_MESSAGES = 10
 SOFT_TIMEOUT_SEC = max(60, int(get_cfg("OUROBOROS_SOFT_TIMEOUT_SEC", default="600") or "600"))
 HARD_TIMEOUT_SEC = max(120, int(get_cfg("OUROBOROS_HARD_TIMEOUT_SEC", default="1800") or "1800"))
-DIAG_HEARTBEAT_SEC = _parse_int_cfg(
-    get_cfg("OUROBOROS_DIAG_HEARTBEAT_SEC", default="30"),
-    default=30,
-    minimum=0,
-)
-DIAG_SLOW_CYCLE_SEC = _parse_int_cfg(
-    get_cfg("OUROBOROS_DIAG_SLOW_CYCLE_SEC", default="20"),
-    default=20,
-    minimum=0,
-)
+DIAG_HEARTBEAT_SEC = _parse_int_cfg(get_cfg("OUROBOROS_DIAG_HEARTBEAT_SEC", default="30"), default=30, minimum=0)
+DIAG_SLOW_CYCLE_SEC = _parse_int_cfg(get_cfg("OUROBOROS_DIAG_SLOW_CYCLE_SEC", default="20"), default=20, minimum=0)
 
+# Propagate to child processes / workers
 os.environ["OPENROUTER_API_KEY"] = str(OPENROUTER_API_KEY)
 os.environ["OPENAI_API_KEY"] = str(OPENAI_API_KEY or "")
 os.environ["ANTHROPIC_API_KEY"] = str(ANTHROPIC_API_KEY or "")
 os.environ["GITHUB_USER"] = str(GITHUB_USER)
 os.environ["GITHUB_REPO"] = str(GITHUB_REPO)
-os.environ["OUROBOROS_MODEL"] = str(MODEL_MAIN or "anthropic/claude-sonnet-4.6")
-os.environ["OUROBOROS_MODEL_CODE"] = str(MODEL_CODE or "anthropic/claude-sonnet-4.6")
+os.environ["OUROBOROS_MODEL"] = str(MODEL_MAIN or "anthropic/claude-sonnet-4-5")
+os.environ["OUROBOROS_MODEL_CODE"] = str(MODEL_CODE or "anthropic/claude-sonnet-4-5")
 if MODEL_LIGHT:
     os.environ["OUROBOROS_MODEL_LIGHT"] = str(MODEL_LIGHT)
 os.environ["OUROBOROS_DIAG_HEARTBEAT_SEC"] = str(DIAG_HEARTBEAT_SEC)
@@ -132,14 +123,20 @@ if str(ANTHROPIC_API_KEY or "").strip():
     ensure_claude_code_cli()
 
 # ----------------------------
-# 2) Local filesystem setup (replaces Drive mount)
+# 2) Local Drive root
 # ----------------------------
-DRIVE_ROOT = pathlib.Path(os.environ.get("DRIVE_ROOT", "/data/ouroboros")).resolve()
-REPO_DIR = pathlib.Path(os.environ.get("REPO_DIR", "/app/ouroboros_repo")).resolve()
+# In Docker: mount a host volume to /data/ouroboros (see docker-compose.yml)
+# Locally: defaults to ~/.ouroboros
+DRIVE_ROOT = pathlib.Path(
+    os.environ.get("OUROBOROS_DRIVE_ROOT", pathlib.Path.home() / ".ouroboros")
+).resolve()
+
+REPO_DIR = pathlib.Path(
+    os.environ.get("OUROBOROS_REPO_DIR", pathlib.Path(__file__).parent)
+).resolve()
 
 for sub in ["state", "logs", "memory", "index", "locks", "archive"]:
     (DRIVE_ROOT / sub).mkdir(parents=True, exist_ok=True)
-REPO_DIR.mkdir(parents=True, exist_ok=True)
 
 # Clear stale owner mailbox files from previous session
 try:
@@ -239,14 +236,14 @@ if restored_pending > 0:
 append_jsonl(DRIVE_ROOT / "logs" / "supervisor.jsonl", {
     "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "type": "launcher_start",
+    "launcher": "docker",
     "branch": load_state().get("current_branch"),
     "sha": load_state().get("current_sha"),
     "max_workers": MAX_WORKERS,
     "model_default": MODEL_MAIN, "model_code": MODEL_CODE, "model_light": MODEL_LIGHT,
     "soft_timeout_sec": SOFT_TIMEOUT_SEC, "hard_timeout_sec": HARD_TIMEOUT_SEC,
-    "worker_start_method": str(os.environ.get("OUROBOROS_WORKER_START_METHOD") or ""),
-    "diag_heartbeat_sec": DIAG_HEARTBEAT_SEC,
-    "diag_slow_cycle_sec": DIAG_SLOW_CYCLE_SEC,
+    "drive_root": str(DRIVE_ROOT),
+    "repo_dir": str(REPO_DIR),
 })
 
 # ----------------------------
@@ -258,7 +255,7 @@ auto_resume_after_restart()
 # 6.2) Direct-mode watchdog
 # ----------------------------
 def _chat_watchdog_loop():
-    """Monitor direct-mode chat agent for hangs. Runs as daemon thread."""
+    """Monitor direct-mode chat agent for hangs."""
     soft_warned = False
     while True:
         time.sleep(30)
@@ -267,35 +264,26 @@ def _chat_watchdog_loop():
             if not agent._busy:
                 soft_warned = False
                 continue
-
             now = time.time()
             idle_sec = now - agent._last_progress_ts
             total_sec = now - agent._task_started_ts
-
             if idle_sec >= HARD_TIMEOUT_SEC:
                 st = load_state()
                 if st.get("owner_chat_id"):
-                    send_with_budget(
-                        int(st["owner_chat_id"]),
-                        f"⚠️ Task stuck ({int(total_sec)}s without progress). "
-                        f"Restarting agent.",
-                    )
+                    send_with_budget(int(st["owner_chat_id"]),
+                                     f"⚠️ Task stuck ({int(total_sec)}s). Restarting agent.")
                 reset_chat_agent()
                 soft_warned = False
                 continue
-
             if idle_sec >= SOFT_TIMEOUT_SEC and not soft_warned:
                 soft_warned = True
                 st = load_state()
                 if st.get("owner_chat_id"):
-                    send_with_budget(
-                        int(st["owner_chat_id"]),
-                        f"⏱️ Task running for {int(total_sec)}s, "
-                        f"last progress {int(idle_sec)}s ago. Continuing.",
-                    )
+                    send_with_budget(int(st["owner_chat_id"]),
+                                     f"⏱️ Task running {int(total_sec)}s, "
+                                     f"last progress {int(idle_sec)}s ago. Continuing.")
         except Exception:
-            log.debug("Failed to check/notify chat watchdog", exc_info=True)
-            pass
+            log.debug("Watchdog check failed", exc_info=True)
 
 _watchdog_thread = threading.Thread(target=_chat_watchdog_loop, daemon=True)
 _watchdog_thread.start()
@@ -321,7 +309,6 @@ _consciousness = BackgroundConsciousness(
 )
 
 def reset_chat_agent():
-    """Reset the direct-mode chat agent (called by watchdog on hangs)."""
     import supervisor.workers as _w
     _w._chat_agent = None
 
@@ -355,22 +342,13 @@ _event_ctx = types.SimpleNamespace(
     consciousness=_consciousness,
 )
 
-
 def _safe_qsize(q: Any) -> int:
     try:
         return int(q.qsize())
     except Exception:
         return -1
 
-
 def _handle_supervisor_command(text: str, chat_id: int, tg_offset: int = 0):
-    """Handle supervisor slash-commands.
-
-    Returns:
-        True  — terminal command fully handled (caller should `continue`)
-        str   — dual-path note to prepend (caller falls through to LLM)
-        ""    — not a recognized command (falsy, caller falls through)
-    """
     lowered = text.strip().lower()
 
     if lowered.startswith("/panic"):
@@ -394,7 +372,6 @@ def _handle_supervisor_command(text: str, chat_id: int, tg_offset: int = 0):
         kill_workers()
         os.execv(sys.executable, [sys.executable, __file__])
 
-    # Dual-path commands: supervisor handles + LLM sees a note
     if lowered.startswith("/status"):
         status = status_text(WORKERS, PENDING, RUNNING, SOFT_TIMEOUT_SEC, HARD_TIMEOUT_SEC)
         send_with_budget(chat_id, status, force_budget=True)
@@ -441,10 +418,9 @@ _last_diag_heartbeat_ts = 0.0
 _last_message_ts: float = time.time()
 _ACTIVE_MODE_SEC: int = 300
 
-# Auto-start background consciousness
 try:
     _consciousness.start()
-    log.info("🧠 Background consciousness auto-started (default: always on)")
+    log.info("🧠 Background consciousness auto-started")
 except Exception as e:
     log.warning("consciousness auto-start failed: %s", e)
 
@@ -453,7 +429,6 @@ while True:
     rotate_chat_log_if_needed(DRIVE_ROOT)
     ensure_workers_healthy()
 
-    # Drain worker events
     event_q = get_event_q()
     while True:
         try:
@@ -475,10 +450,8 @@ while True:
     except Exception as e:
         append_jsonl(
             DRIVE_ROOT / "logs" / "supervisor.jsonl",
-            {
-                "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "type": "telegram_poll_error", "offset": offset, "error": repr(e),
-            },
+            {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+             "type": "telegram_poll_error", "offset": offset, "error": repr(e)},
         )
         time.sleep(1.5)
         continue
@@ -496,7 +469,6 @@ while True:
         caption = str(msg.get("caption") or "")
         now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-        # Extract image if present
         image_data = None
         if msg.get("photo"):
             best_photo = msg["photo"][-1]
@@ -533,7 +505,6 @@ while True:
         _last_message_ts = time.time()
         save_state(st)
 
-        # --- Supervisor commands ---
         if text.strip().lower().startswith("/"):
             try:
                 result = _handle_supervisor_command(text, chat_id, tg_offset=offset)
@@ -549,9 +520,7 @@ while True:
         if not text and not image_data:
             continue
 
-        # Feed observation to consciousness
         _consciousness.inject_observation(f"Owner message: {text[:100]}")
-
         agent = _get_chat_agent()
 
         if agent._busy:
@@ -561,7 +530,6 @@ while True:
                 send_with_budget(chat_id, "📎 Photo received, but a task is in progress. Send again when I'm free.")
             elif text:
                 agent.inject_message(text)
-
         else:
             _BATCH_WINDOW_SEC = 1.5
             _EARLY_EXIT_SEC = 0.15
@@ -569,9 +537,9 @@ while True:
             _batch_deadline = _batch_start + _BATCH_WINDOW_SEC
             _batched_texts = [text] if text else []
             _batched_image = image_data
-
             _batch_state = load_state()
             _batch_state_dirty = False
+
             while time.time() < _batch_deadline:
                 time.sleep(0.1)
                 try:
@@ -618,7 +586,7 @@ while True:
 
             if len(_batched_texts) > 1:
                 final_text = "\n\n".join(_batched_texts)
-                log.info("Message batch: %d messages merged into one", len(_batched_texts))
+                log.info("Message batch: %d messages merged", len(_batched_texts))
             elif _batched_texts:
                 final_text = _batched_texts[0]
             else:
@@ -628,15 +596,14 @@ while True:
                 if final_text:
                     agent.inject_message(final_text)
                 if _batched_image:
-                    send_with_budget(chat_id, "📎 Photo received, but a task is in progress. Send again when I'm free.")
+                    send_with_budget(chat_id, "📎 Photo received, but a task is in progress.")
             else:
                 _consciousness.pause()
                 def _run_task_and_resume(cid, txt, img):
                     try:
-                        handle_chat_direct(cid, txt, image_data=img)
+                        handle_chat_direct(cid, txt, img)
                     finally:
                         _consciousness.resume()
-
                 _t = threading.Thread(
                     target=_run_task_and_resume,
                     args=(chat_id, final_text, _batched_image),
@@ -658,13 +625,11 @@ while True:
     if DIAG_SLOW_CYCLE_SEC > 0 and loop_duration_sec >= float(DIAG_SLOW_CYCLE_SEC):
         append_jsonl(
             DRIVE_ROOT / "logs" / "supervisor.jsonl",
-            {
-                "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "type": "main_loop_slow_cycle",
-                "duration_sec": round(loop_duration_sec, 3),
-                "pending_count": len(PENDING),
-                "running_count": len(RUNNING),
-            },
+            {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+             "type": "main_loop_slow_cycle",
+             "duration_sec": round(loop_duration_sec, 3),
+             "pending_count": len(PENDING),
+             "running_count": len(RUNNING)},
         )
 
     if DIAG_HEARTBEAT_SEC > 0 and (now_epoch - _last_diag_heartbeat_ts) >= float(DIAG_HEARTBEAT_SEC):
@@ -672,18 +637,15 @@ while True:
         workers_alive = sum(1 for w in WORKERS.values() if w.proc.is_alive())
         append_jsonl(
             DRIVE_ROOT / "logs" / "supervisor.jsonl",
-            {
-                "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "type": "main_loop_heartbeat",
-                "offset": offset,
-                "workers_total": workers_total,
-                "workers_alive": workers_alive,
-                "pending_count": len(PENDING),
-                "running_count": len(RUNNING),
-                "event_q_size": _safe_qsize(event_q),
-                "running_task_ids": list(RUNNING.keys())[:5],
-                "spent_usd": st.get("spent_usd"),
-            },
+            {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+             "type": "main_loop_heartbeat",
+             "offset": offset,
+             "workers_total": workers_total,
+             "workers_alive": workers_alive,
+             "pending_count": len(PENDING),
+             "running_count": len(RUNNING),
+             "event_q_size": _safe_qsize(event_q),
+             "spent_usd": st.get("spent_usd")},
         )
         _last_diag_heartbeat_ts = now_epoch
 
