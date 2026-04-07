@@ -1,0 +1,29 @@
+services:
+  ouroboros:
+    build: .
+    restart: unless-stopped
+
+    # Load secrets from .env file (copy from .env.example and fill in)
+    env_file: .env
+
+    volumes:
+      # Persistent storage: host path → container /data/ouroboros
+      # Windows WSL2: use a WSL path, e.g. /home/<user>/.ouroboros
+      # or a Windows path:  C:\ouroboros\data:/data/ouroboros
+      - ouroboros_data:/data/ouroboros
+
+    # Optional: expose nothing (Telegram is the only interface)
+    # ports: []
+
+    # Give it a bit of memory — default is fine for most cases
+    # mem_limit: 2g
+
+volumes:
+  ouroboros_data:
+    # Named volume — Docker manages it.
+    # To use a host directory instead, replace with:
+    #   driver: local
+    #   driver_opts:
+    #     type: none
+    #     device: /your/host/path
+    #     o: bind
