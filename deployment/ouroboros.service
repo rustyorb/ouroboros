@@ -1,0 +1,19 @@
+[Unit]
+Description=Ouroboros Agent - Cyberclaw Instance
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/media/mars/AI/ouroboros
+Environment="PATH=/home/mars/.pyenv/versions/3.12.3/bin:/home/mars/.local/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/media/mars/AI/ouroboros/.venv/bin/python /media/mars/AI/ouroboros/cyberclaw_launcher.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/media/mars/AI/ouroboros/data/logs/service.log
+StandardError=append:/media/mars/AI/ouroboros/data/logs/service_error.log
+
+# Load environment from .env file
+EnvironmentFile=/media/mars/AI/ouroboros/.env
+
+[Install]
+WantedBy=default.target
