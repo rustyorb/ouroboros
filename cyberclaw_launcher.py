@@ -506,7 +506,7 @@ def _telegram_loop():
             st["tg_offset"] = offset
             st["last_owner_message_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             save_state(st)
-            rotate_chat_log_if_needed()
+            rotate_chat_log_if_needed(DRIVE_ROOT)
             log_chat(role="user", content=text, metadata={"chat_id": chat_id})
 
             try:
