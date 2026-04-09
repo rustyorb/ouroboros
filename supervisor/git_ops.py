@@ -301,7 +301,9 @@ def checkout_and_reset(branch: str, reason: str = "unspecified",
         return False, msg
 
     subprocess.run(["git", "checkout", branch], cwd=str(REPO_DIR), check=True)
-    subprocess.run(["git", "reset", "--hard", f"origin/{branch}"], cwd=str(REPO_DIR), check=True)
+    # Merge remote changes instead of hard-resetting, so local commits survive
+    subprocess.run(["git", "merge", "--ff-only", f"origin/{branch}"],
+                   cwd=str(REPO_DIR), check=False)
     # Clean __pycache__ to prevent stale bytecode (git checkout may not update mtime)
     for p in REPO_DIR.rglob("__pycache__"):
         shutil.rmtree(p, ignore_errors=True)
