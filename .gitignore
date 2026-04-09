@@ -24,6 +24,11 @@ build/
 .DS_Store
 Thumbs.db
 
+# Runtime data and venv
+data/
+venv/
+.venv/
+
 # Release artifacts (not tracked)
 .create_release.py
 .release_notes.md
