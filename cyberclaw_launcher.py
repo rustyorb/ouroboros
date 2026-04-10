@@ -446,6 +446,7 @@ def _handle_supervisor_command(text: str, chat_id: int, tg_offset: int = 0):
 
 def _telegram_loop():
     """Telegram message polling loop."""
+    import queue as _queue_mod
     log.info("Starting Telegram loop")
     last_heartbeat = time.time()
     last_snapshot = time.time()
@@ -462,6 +463,15 @@ def _telegram_loop():
         if now - last_snapshot >= 300:
             persist_queue_snapshot(reason="periodic")
             last_snapshot = now
+
+        # Drain event queue (sends replies, processes task completions)
+        event_q = get_event_q()
+        while True:
+            try:
+                evt = event_q.get_nowait()
+            except _queue_mod.Empty:
+                break
+            dispatch_event(evt, _event_ctx)
 
         try:
             updates = TG.get_updates(offset=offset, timeout=15)
