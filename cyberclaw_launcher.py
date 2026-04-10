@@ -507,11 +507,11 @@ def _telegram_loop():
             st["last_owner_message_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             save_state(st)
             rotate_chat_log_if_needed(DRIVE_ROOT)
-            log_chat(role="user", content=text, metadata={"chat_id": chat_id})
+            log_chat("in", chat_id, from_user_id, text)
 
             try:
                 reply_text = handle_chat_direct(text, session_id=st.get("session_id"))
-                log_chat(role="assistant", content=reply_text, metadata={"chat_id": chat_id})
+                log_chat("out", chat_id, from_user_id, reply_text)
                 send_with_budget(chat_id, reply_text)
             except Exception as e:
                 log.error("Chat handling failed", exc_info=True)
