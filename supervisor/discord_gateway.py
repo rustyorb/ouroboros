@@ -102,11 +102,11 @@ class DiscordClient:
             async def on_ready():
                 self._ready = True
                 log.info(f"Discord bot ready: {self._bot.user.name} (ID: {self._bot.user.id})")
-                
-                # Load owner from state
+
+                # Load Discord-specific owner from state
                 try:
                     st = load_state()
-                    saved_owner = st.get("owner_id")
+                    saved_owner = st.get("discord_owner_id")
                     if saved_owner:
                         self._owner_id = int(saved_owner)
                         log.info(f"Discord owner loaded from state: {self._owner_id}")
@@ -123,15 +123,12 @@ class DiscordClient:
                 # Process bot commands first
                 await self._bot.process_commands(message)
                 
-                # Owner recognition (first DM = owner)
-                if not self._owner_id and isinstance(message.channel, discord.DMChannel):
+                # Owner recognition (first message = owner, if not already set)
+                if not self._owner_id:
                     self._owner_id = message.author.id
                     try:
                         st = load_state()
-                        st["owner_id"] = self._owner_id
-                        # Also set owner_chat_id for compatibility with Telegram-based code
-                        # Use negative channel ID to distinguish from Telegram
-                        st["owner_chat_id"] = -abs(message.channel.id)
+                        st["discord_owner_id"] = self._owner_id
                         save_state(st)
                         log.info(f"Discord owner recognized: {message.author.name} (ID: {self._owner_id})")
                     except Exception:

@@ -57,8 +57,12 @@ def _handle_task_heartbeat(evt: Dict[str, Any], ctx: Any) -> None:
 def _handle_typing_start(evt: Dict[str, Any], ctx: Any) -> None:
     try:
         chat_id = int(evt.get("chat_id") or 0)
-        if chat_id:
-            ctx.TG.send_chat_action(chat_id, "typing")
+        if not chat_id:
+            return
+        # Skip typing indicator for Discord channels (not supported the same way)
+        if chat_id > 1_000_000_000_000_000:
+            return
+        ctx.TG.send_chat_action(chat_id, "typing")
     except Exception:
         log.debug("Failed to send typing action to chat", exc_info=True)
         pass
@@ -66,16 +70,25 @@ def _handle_typing_start(evt: Dict[str, Any], ctx: Any) -> None:
 
 def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
     try:
+        chat_id = int(evt["chat_id"])
+        text = str(evt.get("text") or "")
         log_text = evt.get("log_text")
         fmt = str(evt.get("format") or "")
         is_progress = bool(evt.get("is_progress"))
-        ctx.send_with_budget(
-            int(evt["chat_id"]),
-            str(evt.get("text") or ""),
-            log_text=(str(log_text) if isinstance(log_text, str) else None),
-            fmt=fmt,
-            is_progress=is_progress,
-        )
+
+        # Route to Discord if ctx has a Discord client and chat_id matches
+        # a Discord channel (Telegram chat IDs are ~10 digits, Discord channel
+        # IDs are 18+ digits / snowflakes).
+        discord = getattr(ctx, "DISCORD", None)
+        if discord and chat_id > 1_000_000_000_000_000:
+            discord.send_message(chat_id, text)
+        else:
+            ctx.send_with_budget(
+                chat_id, text,
+                log_text=(str(log_text) if isinstance(log_text, str) else None),
+                fmt=fmt,
+                is_progress=is_progress,
+            )
     except Exception as e:
         ctx.append_jsonl(
             ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",

@@ -530,28 +530,14 @@ def _telegram_loop():
         save_state(st)
 
 def _discord_loop():
-    """Discord message polling loop (mirrors Telegram loop structure)."""
+    """Discord message polling loop. Event drain is in _telegram_loop only."""
     if not DISCORD_CLIENT:
         return
 
-    import queue as _queue_mod
+    from supervisor.discord_gateway import log_chat as discord_log_chat
     log.info("Starting Discord loop")
-    last_heartbeat = time.time()
 
     while True:
-        now = time.time()
-        if DIAG_HEARTBEAT_SEC > 0 and now - last_heartbeat >= DIAG_HEARTBEAT_SEC:
-            last_heartbeat = now
-
-        # Drain event queue (same as Telegram loop)
-        event_q = get_event_q()
-        while True:
-            try:
-                evt = event_q.get_nowait()
-            except _queue_mod.Empty:
-                break
-            dispatch_event(evt, _event_ctx)
-
         messages = DISCORD_CLIENT.get_pending_messages()
         if not messages:
             time.sleep(1)
@@ -566,35 +552,31 @@ def _discord_loop():
             text = str(msg.get("content", "")).strip()
 
             st = load_state()
-            owner_id = st.get("owner_id")
-            if owner_id is None:
-                st["owner_id"] = from_user_id
-                st["owner_chat_id"] = channel_id
-                save_state(st)
-                log.info(f"Discord owner registered: {from_user_id}")
+            discord_owner = st.get("discord_owner_id")
 
-            if from_user_id != st.get("owner_id"):
+            # Auto-register Discord owner on first message
+            if discord_owner is None:
+                st["discord_owner_id"] = from_user_id
+                save_state(st)
+                DISCORD_CLIENT.send_message(channel_id, "👋 I recognize you as my creator on Discord. Hello, K.")
+                log.info(f"Discord owner registered: {from_user_id}")
+                discord_owner = from_user_id
+
+            if from_user_id != discord_owner:
                 continue
 
             log.info(f"Discord message from owner: {text[:80]}")
 
-            supervisor_handled = _handle_supervisor_command(text, channel_id, tg_offset=st.get("tg_offset", 0))
-            if supervisor_handled is True:
-                continue
-            elif isinstance(supervisor_handled, str):
-                text = supervisor_handled
-
             st = load_state()
             st["last_owner_message_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             save_state(st)
-            rotate_chat_log_if_needed(DRIVE_ROOT)
-            log_chat("in", channel_id, from_user_id, text)
+            discord_log_chat("in", channel_id, from_user_id, text)
 
             try:
                 handle_chat_direct(channel_id, text)
             except Exception as e:
                 log.error("Discord chat handling failed", exc_info=True)
-                send_with_budget(channel_id, f"⚠️ Internal error: {e}")
+                DISCORD_CLIENT.send_message(channel_id, f"⚠️ Internal error: {e}")
 
 # ----------------------------
 # 8) Start loops
