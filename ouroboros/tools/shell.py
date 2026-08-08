@@ -174,8 +174,9 @@ def _claude_code_edit(ctx: ToolContext, prompt: str, cwd: str = "") -> str:
     from ouroboros.tools.git import _acquire_git_lock, _release_git_lock
 
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        return "⚠️ ANTHROPIC_API_KEY not set, claude_code_edit unavailable."
+    oauth_login = (pathlib.Path.home() / ".claude" / ".credentials.json").exists()
+    if not api_key and not oauth_login:
+        return "⚠️ No Claude credentials (ANTHROPIC_API_KEY or Claude CLI OAuth login), claude_code_edit unavailable."
 
     work_dir = str(ctx.repo_dir)
     if cwd and cwd.strip() not in ("", ".", "./"):
@@ -185,7 +186,7 @@ def _claude_code_edit(ctx: ToolContext, prompt: str, cwd: str = "") -> str:
 
     claude_bin = shutil.which("claude")
     if not claude_bin:
-        return "⚠️ Claude CLI not found. Ensure ANTHROPIC_API_KEY is set."
+        return "⚠️ Claude CLI not found. Install Claude Code CLI to enable claude_code_edit."
 
     ctx.emit_progress_fn("Delegating to Claude Code CLI...")
 
@@ -203,7 +204,11 @@ def _claude_code_edit(ctx: ToolContext, prompt: str, cwd: str = "") -> str:
         )
 
         env = os.environ.copy()
-        env["ANTHROPIC_API_KEY"] = api_key
+        if api_key:
+            env["ANTHROPIC_API_KEY"] = api_key
+        else:
+            # OAuth mode: a set ANTHROPIC_API_KEY (even empty) overrides the CLI's stored login
+            env.pop("ANTHROPIC_API_KEY", None)
         try:
             if hasattr(os, "geteuid") and os.geteuid() == 0:
                 env.setdefault("IS_SANDBOX", "1")

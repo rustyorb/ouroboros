@@ -119,7 +119,9 @@ DIAG_SLOW_CYCLE_SEC = _parse_int_cfg(get_cfg("OUROBOROS_DIAG_SLOW_CYCLE_SEC", de
 # Propagate to child processes / workers
 os.environ["OPENROUTER_API_KEY"] = str(OPENROUTER_API_KEY)
 os.environ["OPENAI_API_KEY"] = str(OPENAI_API_KEY or "")
-os.environ["ANTHROPIC_API_KEY"] = str(ANTHROPIC_API_KEY or "")
+# Only export when set: an empty/dead ANTHROPIC_API_KEY overrides Claude CLI's stored OAuth login
+if str(ANTHROPIC_API_KEY or "").strip():
+    os.environ["ANTHROPIC_API_KEY"] = str(ANTHROPIC_API_KEY)
 os.environ["GITHUB_USER"] = str(GITHUB_USER)
 os.environ["GITHUB_REPO"] = str(GITHUB_REPO)
 os.environ["OUROBOROS_MODEL"] = str(MODEL_MAIN or "anthropic/claude-sonnet-4-5")
@@ -132,7 +134,7 @@ os.environ["TELEGRAM_BOT_TOKEN"] = str(TELEGRAM_BOT_TOKEN)
 if DISCORD_BOT_TOKEN:
     os.environ["DISCORD_BOT_TOKEN"] = str(DISCORD_BOT_TOKEN)
 
-if str(ANTHROPIC_API_KEY or "").strip():
+if str(ANTHROPIC_API_KEY or "").strip() or (pathlib.Path.home() / ".claude" / ".credentials.json").exists():
     ensure_claude_code_cli()
 
 # ----------------------------
