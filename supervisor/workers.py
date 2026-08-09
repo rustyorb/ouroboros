@@ -139,8 +139,11 @@ def _get_chat_agent():
     return _chat_agent
 
 
-def handle_chat_direct(chat_id: int, text: str, image_data: Optional[Union[Tuple[str, str], Tuple[str, str, str]]] = None) -> None:
+def handle_chat_direct(chat_id: int, text: str, image_data: Optional[Union[Tuple[str, str], Tuple[str, str, str]]] = None, photo_base64: Optional[str] = None, photo_mime: Optional[str] = None) -> None:
     try:
+        # Photo kwargs (from Telegram photo messages) reuse the image_data path
+        if photo_base64 and not image_data:
+            image_data = (photo_base64, photo_mime or "image/jpeg")
         agent = _get_chat_agent()
         task = {
             "id": uuid.uuid4().hex[:8],

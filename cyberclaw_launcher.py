@@ -492,6 +492,23 @@ def _telegram_loop():
                 continue
 
             text = str(msg_obj.get("text", "")).strip()
+            photo_base64 = None
+            photo_mime = None
+
+            # Handle photos
+            photos = msg_obj.get("photo")  # Array of PhotoSize objects (different resolutions)
+            if photos:
+                # Get largest photo (last in array)
+                largest_photo = photos[-1]
+                file_id = largest_photo.get("file_id")
+                log.info(f"Photo detected in message, {len(photos)} sizes, file_id={file_id}")
+                if file_id:
+                    photo_base64, photo_mime = TG.download_file_base64(file_id)
+                    log.info(f"Photo download result: {'success' if photo_base64 else 'FAILED'}, mime={photo_mime}")
+                # Photo messages carry their text in "caption", not "text"
+                if not text:
+                    text = str(msg_obj.get("caption", "")).strip()
+
             chat_id = int(msg_obj["chat"]["id"])
             from_user_id = int(msg_obj["from"]["id"])
 
@@ -522,7 +539,10 @@ def _telegram_loop():
             log_chat("in", chat_id, from_user_id, text)
 
             try:
-                handle_chat_direct(chat_id, text)
+                if photo_base64:
+                    handle_chat_direct(chat_id, text or "[photo]", photo_base64=photo_base64, photo_mime=photo_mime)
+                else:
+                    handle_chat_direct(chat_id, text)
             except Exception as e:
                 log.error("Chat handling failed", exc_info=True)
                 send_with_budget(chat_id, f"⚠️ Internal error: {e}")
