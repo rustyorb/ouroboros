@@ -7,6 +7,7 @@ TelegramClient, message splitting, markdown→HTML conversion, send_with_budget.
 from __future__ import annotations
 
 import datetime
+import json
 import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -406,6 +407,52 @@ def budget_line(force: bool = False) -> str:
         return ""
 
 
+def tool_attestation_line(task_id: Optional[str]) -> str:
+    """Machine-stamped receipt of what tools ACTUALLY ran for a task.
+
+    Counted from the supervisor's own tool log, never from model output —
+    the model cannot fake a footer it does not write. (Surgery #5, 2026-08-09,
+    designed by Ouroboros, installed by Fable.)
+    """
+    if not task_id:
+        return ""
+    try:
+        path = DRIVE_ROOT / "logs" / "tools.jsonl"
+        if not path.exists():
+            return "⚙ no tools executed"
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 131072))
+            tail = f.read().decode("utf-8", errors="replace")
+        names: Dict[str, int] = {}
+        errors = 0
+        for line in tail.splitlines():
+            if task_id not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("task_id") != task_id:
+                continue
+            if rec.get("type") == "tool_error":
+                errors += 1
+            tool = rec.get("tool")
+            if tool:
+                names[str(tool)] = names.get(str(tool), 0) + 1
+        if not names:
+            return "⚙ no tools executed"
+        parts = [f"{n} x{c}" if c > 1 else n for n, c in names.items()]
+        out = "⚙ tools this turn: " + ", ".join(parts)
+        if errors:
+            out += f" ({errors} error{'s' if errors != 1 else ''})"
+        return out
+    except Exception:
+        log.debug("Suppressed exception in tool_attestation_line", exc_info=True)
+        return "⚙ attestation unavailable"
+
+
 def log_chat(direction: str, chat_id: int, user_id: int, text: str) -> None:
     append_jsonl(DRIVE_ROOT / "logs" / "chat.jsonl", {
         "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -419,7 +466,8 @@ def log_chat(direction: str, chat_id: int, user_id: int, text: str) -> None:
 
 def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
                      force_budget: bool = False, fmt: str = "",
-                     is_progress: bool = False) -> None:
+                     is_progress: bool = False,
+                     task_id: Optional[str] = None) -> None:
     st = load_state()
     owner_id = int(st.get("owner_id") or 0)
     # Progress messages go to progress.jsonl instead of chat.jsonl
@@ -433,17 +481,20 @@ def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
     else:
         log_chat("out", chat_id, owner_id, text if log_text is None else log_text)
     budget = budget_line(force=force_budget)
+    attest = "" if is_progress else tool_attestation_line(task_id)
+    footer = "\n".join(p for p in (attest, budget) if p)
     _text = str(text or "")
-    if not budget:
-        if _text.strip() in ("", "\u200b"):
-            return
-        full = _text
-    else:
-        base = _text.rstrip()
-        if base in ("", "\u200b"):
+    base = _text.rstrip()
+    if base in ("", "\u200b"):
+        # Preserve pre-surgery behavior for empty messages: budget-only or skip.
+        if budget:
             full = budget
         else:
-            full = base + "\n\n" + budget
+            return
+    elif not footer:
+        full = _text
+    else:
+        full = base + "\n\n" + footer
 
     if fmt == "markdown":
         ok, err = _send_markdown_telegram(chat_id, full)

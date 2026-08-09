@@ -83,11 +83,13 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
         if discord and chat_id > 1_000_000_000_000_000:
             discord.send_message(chat_id, text)
         else:
+            task_id = evt.get("task_id")
             ctx.send_with_budget(
                 chat_id, text,
                 log_text=(str(log_text) if isinstance(log_text, str) else None),
                 fmt=fmt,
                 is_progress=is_progress,
+                task_id=(str(task_id) if task_id else None),
             )
     except Exception as e:
         ctx.append_jsonl(
