@@ -10,6 +10,7 @@ import datetime
 import json
 import logging
 import re
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -73,7 +74,8 @@ class TelegramClient:
                     time.sleep(0.8 * (attempt + 1))
         raise RuntimeError(f"Telegram getUpdates failed after retries: {last_err}")
 
-    def send_message(self, chat_id: int, text: str, parse_mode: str = "") -> Tuple[bool, str]:
+    def send_message(self, chat_id: int, text: str, parse_mode: str = "") -> Tuple[bool, str, Optional[int]]:
+        """Returns (ok, err, message_id). message_id is None on failure."""
         last_err = "unknown"
         for attempt in range(3):
             try:
@@ -85,14 +87,34 @@ class TelegramClient:
                 r.raise_for_status()
                 data = r.json()
                 if data.get("ok") is True:
-                    return True, "ok"
+                    msg_id = (data.get("result") or {}).get("message_id")
+                    return True, "ok", (int(msg_id) if msg_id else None)
                 last_err = f"telegram_api_error: {data}"
             except Exception as e:
                 last_err = repr(e)
             if attempt < 2:
                 import time
                 time.sleep(0.8 * (attempt + 1))
-        return False, last_err
+        return False, last_err, None
+
+    def edit_message_text(self, chat_id: int, message_id: int, text: str,
+                          parse_mode: str = "") -> Tuple[bool, str]:
+        """Edit an existing message in place. Single attempt — callers fall back
+        to send_message on failure (message deleted, >48h old, etc.)."""
+        try:
+            payload: Dict[str, Any] = {"chat_id": chat_id, "message_id": message_id,
+                                       "text": text, "disable_web_page_preview": True}
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
+            r = requests.post(f"{self.base}/editMessageText", data=payload, timeout=30)
+            data = r.json()
+            if data.get("ok") is True:
+                return True, "ok"
+            if "message is not modified" in str(data.get("description") or ""):
+                return True, "not_modified"
+            return False, f"telegram_api_error: {data}"
+        except Exception as e:
+            return False, repr(e)
 
     def send_chat_action(self, chat_id: int, action: str = "typing") -> bool:
         """Send chat action (typing indicator). Best-effort, no retries."""
@@ -349,8 +371,13 @@ def _chunk_markdown_for_telegram(md: str, max_chars: int = 3500) -> List[str]:
     return chunks or [md]
 
 
-def _send_markdown_telegram(chat_id: int, text: str) -> Tuple[bool, str]:
-    """Send markdown text as Telegram HTML, with plain-text fallback."""
+def _send_markdown_telegram(chat_id: int, text: str,
+                            edit_message_id: Optional[int] = None) -> Tuple[bool, str]:
+    """Send markdown text as Telegram HTML, with plain-text fallback.
+
+    If edit_message_id is given, the first chunk edits that message in place
+    (streaming progress bubble); remaining chunks are sent as new messages.
+    """
     tg = get_tg()
     chunks = _chunk_markdown_for_telegram(text or "", max_chars=3200)
     chunks = [c for c in chunks if isinstance(c, str) and c.strip()]
@@ -359,16 +386,73 @@ def _send_markdown_telegram(chat_id: int, text: str) -> Tuple[bool, str]:
     last_err = "ok"
     for md_part in chunks:
         html_text = _markdown_to_telegram_html(md_part)
-        ok, err = tg.send_message(chat_id, _sanitize_telegram_text(html_text), parse_mode="HTML")
+        if edit_message_id is not None:
+            msg_id, edit_message_id = edit_message_id, None  # only first chunk edits
+            ok, err = tg.edit_message_text(
+                chat_id, msg_id, _sanitize_telegram_text(html_text), parse_mode="HTML")
+            if ok:
+                last_err = err
+                continue
+            log.warning("Edit of progress bubble %d failed (%s); sending new message", msg_id, err)
+        ok, err, _ = tg.send_message(chat_id, _sanitize_telegram_text(html_text), parse_mode="HTML")
         if not ok:
             plain = _strip_markdown(md_part)
             if not plain.strip():
                 return False, err
-            ok2, err2 = tg.send_message(chat_id, _sanitize_telegram_text(plain))
+            ok2, err2, _ = tg.send_message(chat_id, _sanitize_telegram_text(plain))
             if not ok2:
                 return False, err2
         last_err = err
     return True, last_err
+
+
+# ---------------------------------------------------------------------------
+# Streaming progress: one live-updating Telegram message per task
+# ---------------------------------------------------------------------------
+_progress_lock = threading.Lock()
+_progress_msg_ids: Dict[str, int] = {}  # task_id -> Telegram message_id
+
+
+def _pop_progress_msg_id(task_id: str) -> Optional[int]:
+    with _progress_lock:
+        return _progress_msg_ids.pop(task_id, None)
+
+
+def _store_progress_msg_id(task_id: str, msg_id: int) -> None:
+    with _progress_lock:
+        while len(_progress_msg_ids) >= 100:  # bound leaks from crashed/timed-out tasks
+            _progress_msg_ids.pop(next(iter(_progress_msg_ids)))
+        _progress_msg_ids[task_id] = msg_id
+
+
+def _send_or_edit_progress(chat_id: int, md_text: str, task_id: str) -> None:
+    """First progress for a task sends a new message; later ones edit it in place.
+
+    This is a live status bubble, not an archive — long text is truncated to one
+    Telegram-sized chunk (full text goes to progress.jsonl). If the edit fails
+    (message deleted, >48h old), fall back to sending a new message.
+    """
+    tg = get_tg()
+    chunk = _chunk_markdown_for_telegram(md_text, max_chars=3200)[0]
+    html_text = _sanitize_telegram_text(_markdown_to_telegram_html(chunk))
+    with _progress_lock:
+        msg_id = _progress_msg_ids.get(task_id)
+    if msg_id is not None:
+        ok, err = tg.edit_message_text(chat_id, msg_id, html_text, parse_mode="HTML")
+        if ok:
+            return
+        log.warning("Progress edit failed for task %s (%s); sending new message", task_id, err)
+    ok, err, new_id = tg.send_message(chat_id, html_text, parse_mode="HTML")
+    if not ok:
+        ok, err, new_id = tg.send_message(chat_id, _sanitize_telegram_text(_strip_markdown(chunk)))
+    if ok and new_id is not None:
+        _store_progress_msg_id(task_id, new_id)
+    elif not ok:
+        append_jsonl(DRIVE_ROOT / "logs" / "supervisor.jsonl", {
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "type": "telegram_send_error",
+            "chat_id": chat_id, "error": err, "is_progress": True,
+        })
 
 
 # ---------------------------------------------------------------------------
