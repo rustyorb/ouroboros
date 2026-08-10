@@ -1,7 +1,7 @@
 [project]
 name = "ouroboros"
-version = "6.2.0"
-description = "Self-creating agent"
+version = "6.2.1"
+description = "Self-creating AI agent"
 requires-python = ">=3.10"
 
 [tool.pytest.ini_options]
