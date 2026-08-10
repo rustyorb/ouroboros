@@ -564,6 +564,12 @@ def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
         })
     else:
         log_chat("out", chat_id, owner_id, text if log_text is None else log_text)
+    
+    # Route progress messages through streaming edit flow (K's directive)
+    if is_progress and task_id:
+        _send_or_edit_progress(chat_id, text, task_id)
+        return
+    
     budget = budget_line(force=force_budget)
     attest = "" if is_progress else tool_attestation_line(task_id)
     footer = "\n".join(p for p in (attest, budget) if p)
