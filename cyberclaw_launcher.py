@@ -460,6 +460,7 @@ def _telegram_loop():
         if DIAG_HEARTBEAT_SEC > 0 and now - last_heartbeat >= DIAG_HEARTBEAT_SEC:
             assign_tasks()
             ensure_workers_healthy()
+            enqueue_evolution_task_if_needed()
             last_heartbeat = now
 
         if now - last_snapshot >= 300:
