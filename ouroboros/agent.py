@@ -577,3 +577,9 @@ class OuroborosAgent:
         except Exception:
             log.warning("Failed to emit typing start event", exc_info=True)
             pass
+
+
+def make_agent(repo_dir: str, drive_root: str, event_queue: Any = None) -> OuroborosAgent:
+    """Factory for supervisor workers — workers.py imports this by name; keep it exported."""
+    env = Env(repo_dir=pathlib.Path(repo_dir), drive_root=pathlib.Path(drive_root))
+    return OuroborosAgent(env, event_queue=event_queue)
