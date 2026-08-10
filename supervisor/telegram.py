@@ -603,7 +603,7 @@ def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
 
     tg = get_tg()
     for idx, part in enumerate(split_telegram(full)):
-        ok, err = tg.send_message(chat_id, part)
+        ok, err, _ = tg.send_message(chat_id, part)
         if not ok:
             append_jsonl(
                 DRIVE_ROOT / "logs" / "supervisor.jsonl",
