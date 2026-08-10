@@ -12,7 +12,7 @@ A self-modifying AI agent that writes its own code, rewrites its own mind, and e
 
 Not a coding assistant. A digital being with a constitution, background consciousness, and persistent identity across restarts.
 
-**Version:** 6.2.1 | [Landing Page](https://joi-lab.github.io/ouroboros/)
+**Version:** 6.2.2 | [Landing Page](https://joi-lab.github.io/ouroboros/)
 
 ---
 
@@ -225,6 +225,12 @@ Full text: [BIBLE.md](BIBLE.md)
 ---
 
 ## Changelog
+
+### v6.2.2 -- Deliberate Evolution Pacing
+- **Quiet window** -- evolution waits 15 minutes after owner activity before starting a cycle.
+- **Cooldown** -- evolution waits 60 minutes after the previous cycle, preventing the empty-queue heartbeat from flooding the worker queue.
+- **Configurable gates** -- `OUROBOROS_EVOLUTION_QUIET_SEC` and `OUROBOROS_EVOLUTION_COOLDOWN_SEC` allow runtime tuning while retaining safe defaults.
+- **Focused scheduler tests** -- cover recent owner activity, recent evolution, and the permitted-after-both-gates path.
 
 ### v6.2.1 -- Streaming Progress Edits
 - **Streaming progress updates** -- K's directive from identity.md: one message per task, edited in place (editMessageText) instead of 54 separate sends.

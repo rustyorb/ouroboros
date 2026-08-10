@@ -13,6 +13,7 @@ import pathlib
 import threading
 import time
 import uuid
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from supervisor.state import (
@@ -33,6 +34,10 @@ SOFT_TIMEOUT_SEC: int = 600
 HARD_TIMEOUT_SEC: int = 1800
 HEARTBEAT_STALE_SEC: int = 120
 QUEUE_MAX_RETRIES: int = 1
+# Evolution is intentionally paced: an idle queue is not permission to
+# immediately start another expensive cycle.
+EVOLUTION_COOLDOWN_SEC: int = max(0, int(os.environ.get("OUROBOROS_EVOLUTION_COOLDOWN_SEC", "3600")))
+EVOLUTION_QUIET_SEC: int = max(0, int(os.environ.get("OUROBOROS_EVOLUTION_QUIET_SEC", "900")))
 
 
 def init(drive_root: pathlib.Path, soft_timeout: int, hard_timeout: int) -> None:
@@ -388,6 +393,16 @@ def enqueue_evolution_task_if_needed() -> None:
         return
     owner_chat_id = st.get("owner_chat_id")
     if not owner_chat_id:
+        return
+
+    # Do not treat an empty queue as sufficient evidence of a quiet system.
+    # Owner activity and the previous evolution both impose deliberate pacing.
+    now = time.time()
+    last_owner_ts = parse_iso_to_ts(str(st.get("last_owner_message_at") or ""))
+    if last_owner_ts is not None and now - last_owner_ts < EVOLUTION_QUIET_SEC:
+        return
+    last_evolution_ts = parse_iso_to_ts(str(st.get("last_evolution_task_at") or ""))
+    if last_evolution_ts is not None and now - last_evolution_ts < EVOLUTION_COOLDOWN_SEC:
         return
 
     # Circuit breaker: check for consecutive evolution failures
