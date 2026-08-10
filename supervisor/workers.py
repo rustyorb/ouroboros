@@ -197,6 +197,21 @@ def auto_resume_after_restart() -> None:
     Background consciousness will subsume this eventually, but auto-resume is
     needed immediately after a restart so the agent doesn't go silent.
     """
+    lock_path = DRIVE_ROOT / "locks" / "auto_resume.lock"
+    if lock_path.exists():
+        try:
+            if time.time() - lock_path.stat().st_mtime < 300:
+                return  # already running
+        except Exception:
+            log.debug("Suppressed exception", exc_info=True)
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(
+            datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            encoding="utf-8",
+        )
+    except Exception:
+        log.debug("Suppressed exception", exc_info=True)
     try:
         st = load_state()
         chat_id = st.get("owner_chat_id")
@@ -271,6 +286,11 @@ def auto_resume_after_restart() -> None:
             "type": "auto_resume_error",
             "error": repr(e),
         })
+    finally:
+        try:
+            lock_path.unlink()
+        except Exception:
+            log.debug("Suppressed exception", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
