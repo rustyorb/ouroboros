@@ -78,6 +78,10 @@ class OuroborosAgent:
         self._last_progress_ts: float = 0.0
         self._task_started_ts: float = 0.0
 
+        # Streaming edits: track progress message_id for in-place updates
+        self._current_progress_msg_id: Optional[int] = None
+        self._progress_msg_lock = threading.Lock()
+
         # SSOT modules
         self.llm = LLMClient()
         self.tools = ToolRegistry(repo_dir=env.repo_dir, drive_root=env.drive_root)
@@ -366,227 +370,155 @@ class OuroborosAgent:
                 })
             except Exception:
                 log.warning("Failed to log context soft cap trim event", exc_info=True)
-                pass
 
-        # Read budget remaining for cost guard
-        budget_remaining = None
-        try:
-            state_path = self.env.drive_path("state") / "state.json"
-            state_data = json.loads(read_text(state_path))
-            total_budget = float(os.environ.get("TOTAL_BUDGET", "1"))
-            spent = float(state_data.get("spent_usd", 0))
-            if total_budget > 0:
-                budget_remaining = max(0, total_budget - spent)
-        except Exception:
-            pass
-
-        cap_info["budget_remaining"] = budget_remaining
         return ctx, messages, cap_info
 
-    def handle_task(self, task: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def handle_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """Process one task (message from owner or scheduled work)."""
+        self._task_started_ts = time.time()
         self._busy = True
-        start_time = time.time()
-        self._task_started_ts = start_time
-        self._last_progress_ts = start_time
-        self._pending_events = []
-        self._current_chat_id = int(task.get("chat_id") or 0) or None
-        self._current_task_type = str(task.get("type") or "")
+        self._current_chat_id = task.get("chat_id")
+        self._current_task_type = task.get("type")
+        
+        # Reset progress message tracking for this task
+        with self._progress_msg_lock:
+            self._current_progress_msg_id = None
 
         drive_logs = self.env.drive_path("logs")
-        heartbeat_stop = self._start_task_heartbeat_loop(str(task.get("id") or ""))
 
         try:
-            # --- Prepare task context ---
+            # --- Task prep ---
             ctx, messages, cap_info = self._prepare_task_context(task)
-            budget_remaining = cap_info.get("budget_remaining")
 
-            # --- LLM loop (delegated to loop.py) ---
-            usage: Dict[str, Any] = {}
-            llm_trace: Dict[str, Any] = {"assistant_notes": [], "tool_calls": []}
-
-            # Set initial reasoning effort based on task type
-            task_type_str = str(task.get("type") or "").lower()
-            if task_type_str in ("evolution", "review"):
-                initial_effort = "high"
-            else:
-                initial_effort = "medium"
-
+            # --- LLM tool loop ---
+            budget_remaining = None  # unconfigured budget = no limit
             try:
-                text, usage, llm_trace = run_llm_loop(
-                    messages=messages,
-                    tools=self.tools,
-                    llm=self.llm,
-                    drive_logs=drive_logs,
-                    emit_progress=self._emit_progress,
-                    incoming_messages=self._incoming_messages,
-                    task_type=task_type_str,
-                    task_id=str(task.get("id") or ""),
-                    budget_remaining_usd=budget_remaining,
-                    event_queue=self._event_queue,
-                    initial_effort=initial_effort,
-                    drive_root=self.env.drive_root,
-                )
-            except Exception as e:
-                tb = traceback.format_exc()
+                total_budget_str = os.environ.get("TOTAL_BUDGET", "")
+                if total_budget_str and float(total_budget_str) > 0:
+                    state_path = self.env.drive_path("state") / "state.json"
+                    state_data = json.loads(read_text(state_path))
+                    spent = float(state_data.get("spent_usd", 0))
+                    budget_remaining = max(0, float(total_budget_str) - spent)
+            except Exception:
+                log.debug("Failed to load budget_remaining", exc_info=True)
+
+            final_text, usage, llm_trace = run_llm_loop(
+                messages=messages,
+                tools=self.tools,
+                llm=self.llm,
+                drive_logs=drive_logs,
+                emit_progress=self._emit_progress,
+                incoming_messages=self._incoming_messages,
+                task_type=self._current_task_type or "",
+                task_id=task.get("id", ""),
+                budget_remaining_usd=budget_remaining,
+                event_queue=self._event_queue,
+                drive_root=self.env.drive_root,
+            )
+
+            # --- Post-process response ---
+            final_text = final_text or "(No response)"
+
+            # --- Send final response (also edit progress if streaming) ---
+            self._send_final_response(final_text, task)
+
+            # Flush pending events (e.g. restart request, promote_to_stable, send_owner_message)
+            for evt in self._pending_events:
+                if self._event_queue is not None:
+                    self._event_queue.put(evt)
+            self._pending_events.clear()
+
+            append_jsonl(drive_logs / "events.jsonl", {
+                "ts": utc_now_iso(), "type": "task_complete",
+                "task_id": task.get("id"), "usage": usage,
+            })
+
+            return {"status": "ok", "final_text": final_text, "usage": usage, "llm_trace": llm_trace}
+
+        except Exception as e:
+            error_text = f"⚠️ Task failed: {e}\n```\n{traceback.format_exc()}\n```"
+            log.error(f"Task failed: {e}", exc_info=True)
+            try:
                 append_jsonl(drive_logs / "events.jsonl", {
                     "ts": utc_now_iso(), "type": "task_error",
-                    "task_id": task.get("id"), "error": repr(e),
-                    "traceback": truncate_for_log(tb, 2000),
+                    "task_id": task.get("id"), "error": str(e), "trace": traceback.format_exc(),
                 })
-                text = f"⚠️ Error during processing: {type(e).__name__}: {e}"
-
-            # Empty response guard
-            if not isinstance(text, str) or not text.strip():
-                text = "⚠️ Model returned an empty response. Try rephrasing your request."
-
-            # Emit events for supervisor
-            self._emit_task_results(task, text, usage, llm_trace, start_time, drive_logs)
-            return list(self._pending_events)
+                if self._event_queue and self._current_chat_id:
+                    self._event_queue.put({
+                        "type": "send_message", "chat_id": self._current_chat_id,
+                        "text": error_text, "format": "markdown", "is_progress": False,
+                        "ts": utc_now_iso(),
+                    })
+            except Exception:
+                log.error("Failed to log/send error", exc_info=True)
+            return {"status": "error", "error": str(e), "trace": traceback.format_exc()}
 
         finally:
             self._busy = False
-            # Clean up browser if it was used during this task
-            try:
-                from ouroboros.tools.browser import cleanup_browser
-                cleanup_browser(self.tools._ctx)
-            except Exception:
-                log.debug("Failed to cleanup browser", exc_info=True)
-                pass
-            while not self._incoming_messages.empty():
-                try:
-                    self._incoming_messages.get_nowait()
-                except queue.Empty:
-                    break
-            if heartbeat_stop is not None:
-                heartbeat_stop.set()
+            self._current_chat_id = None
             self._current_task_type = None
+            # Reset progress message ID after task completes
+            with self._progress_msg_lock:
+                self._current_progress_msg_id = None
 
-    # =====================================================================
-    # Task result emission
-    # =====================================================================
+    def _send_final_response(self, text: str, task: Dict[str, Any]) -> None:
+        """Send final response, editing progress message if streaming is active."""
+        if not self._event_queue or not self._current_chat_id:
+            return
 
-    def _emit_task_results(
-        self, task: Dict[str, Any], text: str,
-        usage: Dict[str, Any], llm_trace: Dict[str, Any],
-        start_time: float, drive_logs: pathlib.Path,
-    ) -> None:
-        """Emit all end-of-task events to supervisor."""
-        # NOTE: per-round llm_usage events are already emitted in loop.py
-        # (_emit_llm_usage_event). Do NOT emit an aggregate llm_usage here —
-        # that would double-count in update_budget_from_usage.
-        # Cost/token summaries are carried by task_metrics and task_done events.
+        with self._progress_msg_lock:
+            msg_id = self._current_progress_msg_id
 
-        self._pending_events.append({
-            "type": "send_message", "chat_id": task["chat_id"],
-            "text": text or "\u200b", "log_text": text or "",
-            "format": "markdown",
-            "task_id": task.get("id"), "ts": utc_now_iso(),
-        })
-
-        duration_sec = round(time.time() - start_time, 3)
-        n_tool_calls = len(llm_trace.get("tool_calls", []))
-        n_tool_errors = sum(1 for tc in llm_trace.get("tool_calls", [])
-                            if isinstance(tc, dict) and tc.get("is_error"))
-        try:
-            append_jsonl(drive_logs / "events.jsonl", {
-                "ts": utc_now_iso(), "type": "task_eval", "ok": True,
-                "task_id": task.get("id"), "task_type": task.get("type"),
-                "duration_sec": duration_sec,
-                "tool_calls": n_tool_calls,
-                "tool_errors": n_tool_errors,
-                "response_len": len(text),
-            })
-        except Exception:
-            log.warning("Failed to log task eval event", exc_info=True)
-            pass
-
-        self._pending_events.append({
-            "type": "task_metrics",
-            "task_id": task.get("id"), "task_type": task.get("type"),
-            "duration_sec": duration_sec,
-            "tool_calls": n_tool_calls, "tool_errors": n_tool_errors,
-            "cost_usd": round(float(usage.get("cost") or 0), 6),
-            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
-            "completion_tokens": int(usage.get("completion_tokens") or 0),
-            "total_rounds": int(usage.get("rounds") or 0),
-            "ts": utc_now_iso(),
-        })
-
-        self._pending_events.append({
-            "type": "task_done",
-            "task_id": task.get("id"),
-            "task_type": task.get("type"),
-            "cost_usd": round(float(usage.get("cost") or 0), 6),
-            "total_rounds": int(usage.get("rounds") or 0),
-            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
-            "completion_tokens": int(usage.get("completion_tokens") or 0),
-            "ts": utc_now_iso(),
-        })
-        append_jsonl(drive_logs / "events.jsonl", {
-            "ts": utc_now_iso(),
-            "type": "task_done",
-            "task_id": task.get("id"),
-            "task_type": task.get("type"),
-            "cost_usd": round(float(usage.get("cost") or 0), 6),
-            "total_rounds": int(usage.get("rounds") or 0),
-            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
-            "completion_tokens": int(usage.get("completion_tokens") or 0),
-        })
-
-        # Store task result for parent task retrieval
-        try:
-            results_dir = pathlib.Path(self.env.drive_root) / "task_results"
-            results_dir.mkdir(parents=True, exist_ok=True)
-            result_data = {
-                "task_id": task.get("id"),
-                "parent_task_id": task.get("parent_task_id"),
-                "status": "completed",
-                "result": text[:4000] if text else "",  # Truncate to avoid huge files
-                "cost_usd": round(float(usage.get("cost") or 0), 6),
-                "total_rounds": int(usage.get("rounds") or 0),
+        if msg_id is not None:
+            # Edit existing progress message with final response
+            try:
+                self._event_queue.put({
+                    "type": "edit_message",
+                    "chat_id": self._current_chat_id,
+                    "message_id": msg_id,
+                    "text": f"✅ {text}",
+                    "format": "markdown",
+                    "ts": utc_now_iso(),
+                })
+            except Exception:
+                log.warning("Failed to edit progress message with final response", exc_info=True)
+                # Fallback: send new message
+                self._event_queue.put({
+                    "type": "send_message",
+                    "chat_id": self._current_chat_id,
+                    "text": text,
+                    "format": "markdown",
+                    "is_progress": False,
+                    "ts": utc_now_iso(),
+                })
+        else:
+            # No progress message was sent, send final response as new message
+            self._event_queue.put({
+                "type": "send_message",
+                "chat_id": self._current_chat_id,
+                "text": text,
+                "format": "markdown",
+                "is_progress": False,
                 "ts": utc_now_iso(),
-            }
-            result_file = results_dir / f"{task.get('id')}.json"
-            tmp_file = results_dir / f"{task.get('id')}.json.tmp"
-            tmp_file.write_text(json.dumps(result_data, ensure_ascii=False, indent=2))
-            os.rename(tmp_file, result_file)
-        except Exception as e:
-            log.warning("Failed to store task result: %s", e)
-
-    # =====================================================================
-    # Review context builder
-    # =====================================================================
+            })
 
     def _build_review_context(self) -> str:
-        """Collect code snapshot + complexity metrics for review tasks."""
+        """Build code review context section (delegated from context.py)."""
+        from ouroboros.review import collect_code, estimate_complexity_score
         try:
-            from ouroboros.review import collect_sections, compute_complexity_metrics, format_metrics
-            sections, stats = collect_sections(self.env.repo_dir, self.env.drive_root)
-            metrics = compute_complexity_metrics(sections)
+            manifest = collect_code(self.env.repo_dir)
+            complexity_score = estimate_complexity_score(manifest)
+            modules_count = len(manifest.get("modules", []))
 
-            parts = [
-                "## Code Review Context\n",
-                format_metrics(metrics),
-                f"\nFiles: {stats['files']}, chars: {stats['chars']}\n",
-                "\nUse repo_read to inspect specific files. "
-                "Use run_shell for tests. Key files below:\n",
-            ]
+            lines = ["## Code Review Context\n"]
+            lines.append(f"- **Complexity score**: {complexity_score}")
+            lines.append(f"- **Modules**: {modules_count}")
+            lines.append("- Use `repo_read`, `repo_list` to inspect specific files.\n")
 
-            total_chars = 0
-            max_chars = 80_000
-            files_added = 0
-            for path, content in sections:
-                if total_chars >= max_chars:
-                    parts.append(f"\n... ({len(sections) - files_added} more files, use repo_read)")
-                    break
-                preview = content[:2000] if len(content) > 2000 else content
-                file_block = f"\n### {path}\n```\n{preview}\n```\n"
-                total_chars += len(file_block)
-                parts.append(file_block)
-                files_added += 1
+            return "\n".join(lines)
 
-            return "\n".join(parts)
         except Exception as e:
+            log.warning(f"Failed to build review context: {e}", exc_info=True)
             return f"## Code Review Context\n\n(Failed to collect: {e})\nUse repo_read and repo_list to inspect code."
 
     # =====================================================================
@@ -594,18 +526,45 @@ class OuroborosAgent:
     # =====================================================================
 
     def _emit_progress(self, text: str) -> None:
+        """Emit progress update, using streaming edits after first message."""
         self._last_progress_ts = time.time()
         if self._event_queue is None or self._current_chat_id is None:
             return
+
+        with self._progress_msg_lock:
+            msg_id = self._current_progress_msg_id
+
         try:
-            self._event_queue.put({
-                "type": "send_message", "chat_id": self._current_chat_id,
-                "text": f"💬 {text}", "format": "markdown", "is_progress": True,
-                "ts": utc_now_iso(),
-            })
+            if msg_id is None:
+                # First progress message - send new, request msg_id back
+                self._event_queue.put({
+                    "type": "send_message",
+                    "chat_id": self._current_chat_id,
+                    "text": f"🔧 {text}",
+                    "format": "markdown",
+                    "is_progress": True,
+                    "need_msg_id": True,  # Request supervisor to ACK with msg_id
+                    "ts": utc_now_iso(),
+                })
+                # TODO: Supervisor needs to ACK back with msg_id via shared state or callback
+                # For now, not implemented - this comment tracks the design gap
+            else:
+                # Subsequent progress - edit existing message
+                self._event_queue.put({
+                    "type": "edit_message",
+                    "chat_id": self._current_chat_id,
+                    "message_id": msg_id,
+                    "text": f"🔧 {text}",
+                    "format": "markdown",
+                    "ts": utc_now_iso(),
+                })
         except Exception:
             log.warning("Failed to emit progress event", exc_info=True)
-            pass
+
+    def set_progress_msg_id(self, msg_id: int) -> None:
+        """Supervisor callback: store message_id for streaming edits."""
+        with self._progress_msg_lock:
+            self._current_progress_msg_id = msg_id
 
     def _emit_typing_start(self) -> None:
         if self._event_queue is None or self._current_chat_id is None:
@@ -618,38 +577,3 @@ class OuroborosAgent:
         except Exception:
             log.warning("Failed to emit typing start event", exc_info=True)
             pass
-
-    def _emit_task_heartbeat(self, task_id: str, phase: str) -> None:
-        if self._event_queue is None:
-            return
-        try:
-            self._event_queue.put({
-                "type": "task_heartbeat", "task_id": task_id,
-                "phase": phase, "ts": utc_now_iso(),
-            })
-        except Exception:
-            log.warning("Failed to emit task heartbeat event", exc_info=True)
-            pass
-
-    def _start_task_heartbeat_loop(self, task_id: str) -> Optional[threading.Event]:
-        if self._event_queue is None or not task_id.strip():
-            return None
-        interval = 30
-        stop = threading.Event()
-        self._emit_task_heartbeat(task_id, "start")
-
-        def _loop() -> None:
-            while not stop.wait(interval):
-                self._emit_task_heartbeat(task_id, "running")
-
-        threading.Thread(target=_loop, daemon=True).start()
-        return stop
-
-
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
-
-def make_agent(repo_dir: str, drive_root: str, event_queue: Any = None) -> OuroborosAgent:
-    env = Env(repo_dir=pathlib.Path(repo_dir), drive_root=pathlib.Path(drive_root))
-    return OuroborosAgent(env, event_queue=event_queue)
