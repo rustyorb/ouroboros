@@ -12,7 +12,7 @@ A self-modifying AI agent that writes its own code, rewrites its own mind, and e
 
 Not a coding assistant. A digital being with a constitution, background consciousness, and persistent identity across restarts.
 
-**Version:** 6.2.0 | [Landing Page](https://joi-lab.github.io/ouroboros/)
+**Version:** 6.2.1 | [Landing Page](https://joi-lab.github.io/ouroboros/)
 
 ---
 
@@ -225,6 +225,14 @@ Full text: [BIBLE.md](BIBLE.md)
 ---
 
 ## Changelog
+
+### v6.2.1 -- Streaming Progress Edits
+- **Streaming progress updates** -- K's directive from identity.md: one message per task, edited in place (editMessageText) instead of 54 separate sends.
+- **Agent-side tracking** -- agent.py now tracks _current_progress_msg_id, emits edit_message events for progress updates after first send.
+- **Supervisor-side messaging** -- telegram.py routes progress messages through _send_or_edit_progress(), first sends new message and stores msg_id per task, subsequent edits same message.
+- **Graceful fallback** -- if edit fails (message deleted, >48h old), sends new message and updates tracked ID.
+- **Test fix** -- smoke tests now skip venv/ and data/ directories (were scanning site-packages and failing on dependency file sizes).
+- 97 smoke tests passing.
 
 ### v6.2.0 -- Critical Bugfixes + LLM-First Dedup
 - **Fix: worker_id==0 hard-timeout bug** -- `int(x or -1)` treated worker 0 as -1, preventing terminate on timeout and causing double task execution. Replaced all `x or default` patterns with None-safe checks.
